@@ -94,6 +94,7 @@ class ParallelRunnerMixin:
         """
         super().__init__(config, **kwargs)
 
+        #self.myprocs = []
         self.model_comm_group = None
         self.pid = pid
 
@@ -102,13 +103,20 @@ class ParallelRunnerMixin:
 
         self._bootstrap_processes()
 
-        # disable most logging on non-zero ranks
-        if self.global_rank != 0:
-            logging.getLogger().setLevel(logging.WARNING)
+        LOG.info(
+            f"ParallelRunner local/global ranks: {self.local_rank}/{self.global_rank}, host: {socket.gethostname()}"
+        )
 
-        if str(self.device) == "cuda":
-            self.device = f"{self.device}:{self.local_rank}"
-            torch.cuda.set_device(self.local_rank)
+        if self.device.type == "cuda":
+            self.device = torch.device("cuda", index=self.local_rank)
+            torch.cuda.set_device(self.device)
+            LOG.info(f"ParallelRunner changing to device `{self.device}`")
+        else:
+            LOG.info(f"ParallelRunner device `{self.device}` is unchanged")
+
+        # disable most logging on non-zero ranks
+        #if self.global_rank != 0:
+        #    logging.getLogger().setLevel(logging.WARNING)
 
         # Create a model comm group for parallel inference
         # A dummy comm group is created if only a single device is in use
@@ -171,6 +179,20 @@ class ParallelRunnerMixin:
         if self.model_comm_group is not None:
             dist.destroy_process_group()
 
+    def execute(self) -> None:
+        """Execute the runner."""
+        super().execute()
+        LOG.info("about to shutdown... maybe")
+        import torch.multiprocessing as mp
+
+        LOG.info("get context")
+        ctx = mp.get_context("spawn")
+        config = self.config
+        #for p in self.myprocs:
+        #    LOG.info(f"p.join")
+        #    p.join()
+
+
     def _seed_procs(self) -> None:
         """Ensures each process uses the same seed.
         Will try read 'ANEMOI_BASE_SEED' from the environment.
@@ -229,10 +251,20 @@ class ParallelRunnerMixin:
         # Create N-1 procs, each with a unique PID
         import torch.multiprocessing as mp
 
-        mp.set_start_method("spawn")
+        ctx = mp.get_context("spawn")
         config = self.config
+
+
         for pid in range(1, num_procs):
-            mp.Process(target=create_parallel_runner, args=(config, pid)).start()
+            p = ctx.Process(target=create_parallel_runner, args=(config, pid))
+            if not p.is_alive():
+                LOG.info(f"spawning process {pid}")
+                p.start()
+            else:
+                LOG.info(f"don't need to spawn process {pid}")
+
+            #self.myprocs.append(p)
+
 
     def _bootstrap_processes(self) -> None:
         """Initialises processes and their network information.
@@ -358,14 +390,15 @@ class ParallelRunnerMixin:
                 else:
                     backend = "gloo"
 
-            dist.init_process_group(
-                backend=backend,
-                init_method=f"tcp://{self.master_addr}:{self.master_port}",
-                timeout=datetime.timedelta(minutes=3),
-                world_size=self.world_size,
-                rank=self.global_rank,
-            )
-            LOG.info(f"Creating a model communication group with {self.world_size} devices with the {backend} backend")
+            if not dist.is_initialized():
+                dist.init_process_group(
+                    backend=backend,
+                    init_method=f"tcp://{self.master_addr}:{self.master_port}",
+                    timeout=datetime.timedelta(minutes=3),
+                    world_size=self.world_size,
+                    rank=self.global_rank,
+                )
+                LOG.info(f"Creating a model communication group with {self.world_size} devices with the {backend} backend")
 
             model_comm_group_ranks = np.arange(self.world_size, dtype=int)
             model_comm_group = dist.new_group(model_comm_group_ranks)
